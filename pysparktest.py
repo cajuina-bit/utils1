@@ -58,11 +58,16 @@ class SparkPatternDetector(ast.NodeVisitor):
                 if self._is_cache_call(node.value):
                     cache_type = self._get_cache_type(node.value)
                     self.cached_vars[var_name] = (node.lineno, cache_type)
-                elif isinstance(node.value, ast.Attribute):
-                    # Check for chained calls like df.filter().cache()
+                else:
+                    # Check for chained calls like spark.table().cache() or df.filter().cache()
                     if self._has_cache_in_chain(node.value):
                         cache_type = self._get_cache_type_from_chain(node.value)
                         self.cached_vars[var_name] = (node.lineno, cache_type)
+            elif isinstance(node.value, ast.Attribute):
+                # Check for chained calls like df.filter().cache()
+                if self._has_cache_in_chain(node.value):
+                    cache_type = self._get_cache_type_from_chain(node.value)
+                    self.cached_vars[var_name] = (node.lineno, cache_type)
 
         self.generic_visit(node)
 
@@ -83,12 +88,32 @@ class SparkPatternDetector(ast.NodeVisitor):
                     code_line = self._get_source_line(node.lineno)
                     self.var_actions[var_name].append((f'aggregation_{method_name}', node.lineno, code_line, self.in_loop))
 
+                # Check for write operations that trigger computation
+                elif method_name in ['write', 'save', 'saveAsTable']:
+                    code_line = self._get_source_line(node.lineno)
+                    self.var_actions[var_name].append((f'write_{method_name}', node.lineno, code_line, self.in_loop))
+
             # Check for chained operations like df.filter().count()
             elif self._is_chained_filter_count(node):
                 base_var = self._get_base_variable(node.func.value)
                 if base_var:
                     code_line = self._get_source_line(node.lineno)
                     self.var_actions[base_var].append(('filter_count', node.lineno, code_line, self.in_loop))
+
+            # Check for any other chained operations that end with actions
+            elif isinstance(node.func, ast.Attribute) and node.func.attr in ['count', 'collect', 'take', 'first', 'show', 'head']:
+                base_var = self._get_base_variable(node.func.value)
+                if base_var and base_var in self.cached_vars:  # Only track if base variable is cached
+                    code_line = self._get_source_line(node.lineno)
+                    self.var_actions[base_var].append((f'chained_{node.func.attr}', node.lineno, code_line, self.in_loop))
+
+            # Check for chained write operations like df.coalesce().write.parquet()
+            elif self._is_chained_write_operation(node):
+                base_var = self._get_base_variable_from_chain(node)
+                if base_var:
+                    code_line = self._get_source_line(node.lineno)
+                    write_method = self._get_write_method_from_chain(node)
+                    self.var_actions[base_var].append((f'write_{write_method}', node.lineno, code_line, self.in_loop))
 
         self.generic_visit(node)
 
@@ -113,20 +138,37 @@ class SparkPatternDetector(ast.NodeVisitor):
 
     def _has_cache_in_chain(self, node):
         current = node
-        while isinstance(current, ast.Attribute):
-            if current.attr in ['cache', 'persist']:
-                return True
-            current = current.value
+        while True:
+            if isinstance(current, ast.Attribute):
+                if current.attr in ['cache', 'persist']:
+                    return True
+                current = current.value
+            elif isinstance(current, ast.Call):
+                if isinstance(current.func, ast.Attribute) and current.func.attr in ['cache', 'persist']:
+                    return True
+                current = current.func
+            else:
+                break
         return False
 
     def _get_cache_type_from_chain(self, node):
         current = node
-        while isinstance(current, ast.Attribute):
-            if current.attr == 'cache':
-                return 'cache'
-            elif current.attr == 'persist':
-                return 'persist'
-            current = current.value
+        while True:
+            if isinstance(current, ast.Attribute):
+                if current.attr == 'cache':
+                    return 'cache'
+                elif current.attr == 'persist':
+                    return 'persist'
+                current = current.value
+            elif isinstance(current, ast.Call):
+                if isinstance(current.func, ast.Attribute):
+                    if current.func.attr == 'cache':
+                        return 'cache'
+                    elif current.func.attr == 'persist':
+                        return 'persist'
+                current = current.func
+            else:
+                break
         return 'unknown'
 
     def _is_chained_filter_count(self, node):
@@ -138,11 +180,46 @@ class SparkPatternDetector(ast.NodeVisitor):
 
     def _get_base_variable(self, node):
         current = node
+        # Handle both Call nodes and Attribute nodes
+        while True:
+            if isinstance(current, ast.Call):
+                current = current.func
+            elif isinstance(current, ast.Attribute):
+                current = current.value
+            elif isinstance(current, ast.Name):
+                return current.id
+            else:
+                break
+        return None
+
+    def _is_chained_write_operation(self, node):
+        # Check for patterns like df.write.parquet(), df.coalesce().write.csv(), etc.
+        if isinstance(node.func, ast.Attribute):
+            # Direct write methods like parquet, csv, json, etc.
+            if node.func.attr in ['parquet', 'csv', 'json', 'orc', 'text', 'saveAsTable']:
+                # Check if this is called on a .write attribute
+                if isinstance(node.func.value, ast.Attribute) and node.func.value.attr == 'write':
+                    return True
+        return False
+
+    def _get_base_variable_from_chain(self, node):
+        # Traverse back through the chain to find the original variable
+        current = node
+        while hasattr(current, 'func') and hasattr(current.func, 'value'):
+            current = current.func.value
+
+        # Continue traversing if we hit an attribute
         while hasattr(current, 'value'):
             current = current.value
+
         if isinstance(current, ast.Name):
             return current.id
         return None
+
+    def _get_write_method_from_chain(self, node):
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr
+        return 'unknown'
 
     def _get_source_line(self, line_number):
         try:
@@ -158,14 +235,19 @@ class SparkPatternDetector(ast.NodeVisitor):
         # Pattern 1 & 2: Multiple actions on cached DataFrames
         for var_name, (cache_line, cache_type) in self.cached_vars.items():
             actions = self.var_actions.get(var_name, [])
-            if len(actions) > 1:
+
+            # Check if this should be reported (multiple actions OR actions in loops)
+            loop_actions = [a for a in actions if a[3]]  # in_loop is True
+            should_report = len(actions) > 1 or len(loop_actions) > 0
+
+            if should_report:
                 severity = min(len(actions), 5)  # Cap at 5
 
                 # Count different types of issues
                 count_actions = [a for a in actions if a[0] == 'count']
-                loop_actions = [a for a in actions if a[3]]  # in_loop is True
                 filter_count_actions = [a for a in actions if a[0] == 'filter_count']
                 agg_actions = [a for a in actions if a[0].startswith('aggregation_')]
+                write_actions = [a for a in actions if a[0].startswith('write_')]
 
                 issue_type = "Multiple actions on cached DataFrame"
                 details = []
@@ -183,6 +265,9 @@ class SparkPatternDetector(ast.NodeVisitor):
 
                 if agg_actions:
                     details.append(f"Found {len(agg_actions)} aggregation operations")
+
+                if write_actions:
+                    details.append(f"Found {len(write_actions)} write operations")
 
                 if cache_type == 'persist_memory_and_disk':
                     details.append("Uses MEMORY_AND_DISK storage level")
