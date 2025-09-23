@@ -1,131 +1,333 @@
 #!/usr/bin/env python3
+"""
+Spark Performance Pattern Scanner
 
-import time
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, rand
-from pyspark.storagelevel import StorageLevel
+Scans Python files for patterns that cause performance regressions in Spark 3.3.1,
+particularly around DataFrame caching and repeated actions.
+"""
 
-
-def get_spark():
-    return SparkSession.builder \
-        .appName("Storage UI Cache Test") \
-        .config("spark.sql.adaptive.enabled", "false") \
-        .config("spark.ui.enabled", "true") \
-        .config("spark.ui.port", "4040") \
-        .config("spark.storage.memoryFraction", "0.8") \
-        .getOrCreate()
+import ast
+import os
+import sys
+import argparse
+from collections import defaultdict
+from typing import List, Dict, Tuple, Set
 
 
-def create_data(spark):
-    partitions = 50
-    rows_per_partition = 10000
+class SparkPatternDetector(ast.NodeVisitor):
+    def __init__(self, filename: str):
+        self.filename = filename
+        self.issues = []
+        self.cached_vars = {}  # var_name -> (line_number, cache_type)
+        self.var_actions = defaultdict(list)  # var_name -> [(action, line_number, code)]
+        self.current_function = None
+        self.in_loop = False
+        self.loop_depth = 0
 
-    print(f"Creating {partitions} partitions with {rows_per_partition} rows each")
+    def visit_FunctionDef(self, node):
+        old_function = self.current_function
+        self.current_function = node.name
+        self.generic_visit(node)
+        self.current_function = old_function
 
-    df = spark.range(partitions * rows_per_partition) \
-        .repartition(partitions) \
-        .withColumn("value", rand()) \
-        .withColumn("computed", col("id") * col("value") * 100)
+    def visit_For(self, node):
+        old_loop = self.in_loop
+        old_depth = self.loop_depth
+        self.in_loop = True
+        self.loop_depth += 1
+        self.generic_visit(node)
+        self.in_loop = old_loop
+        self.loop_depth = old_depth
 
-    return df
+    def visit_While(self, node):
+        old_loop = self.in_loop
+        old_depth = self.loop_depth
+        self.in_loop = True
+        self.loop_depth += 1
+        self.generic_visit(node)
+        self.in_loop = old_loop
+        self.loop_depth = old_depth
+
+    def visit_Assign(self, node):
+        # Track variable assignments that involve caching
+        if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            var_name = node.targets[0].id
+
+            # Check if assignment involves cache() or persist()
+            if isinstance(node.value, ast.Call):
+                if self._is_cache_call(node.value):
+                    cache_type = self._get_cache_type(node.value)
+                    self.cached_vars[var_name] = (node.lineno, cache_type)
+                elif isinstance(node.value, ast.Attribute):
+                    # Check for chained calls like df.filter().cache()
+                    if self._has_cache_in_chain(node.value):
+                        cache_type = self._get_cache_type_from_chain(node.value)
+                        self.cached_vars[var_name] = (node.lineno, cache_type)
+
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        # Track actions on variables
+        if isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name):
+                var_name = node.func.value.id
+                method_name = node.func.attr
+
+                # Check for Spark actions
+                if method_name in ['count', 'collect', 'take', 'first', 'show', 'head']:
+                    code_line = self._get_source_line(node.lineno)
+                    self.var_actions[var_name].append((method_name, node.lineno, code_line, self.in_loop))
+
+                # Check for aggregations and groupBy
+                elif method_name in ['agg', 'groupBy', 'groupby', 'sum', 'avg', 'mean', 'max', 'min']:
+                    code_line = self._get_source_line(node.lineno)
+                    self.var_actions[var_name].append((f'aggregation_{method_name}', node.lineno, code_line, self.in_loop))
+
+            # Check for chained operations like df.filter().count()
+            elif self._is_chained_filter_count(node):
+                base_var = self._get_base_variable(node.func.value)
+                if base_var:
+                    code_line = self._get_source_line(node.lineno)
+                    self.var_actions[base_var].append(('filter_count', node.lineno, code_line, self.in_loop))
+
+        self.generic_visit(node)
+
+    def _is_cache_call(self, node):
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr in ['cache', 'persist']
+        return False
+
+    def _get_cache_type(self, node):
+        if isinstance(node.func, ast.Attribute):
+            if node.func.attr == 'cache':
+                return 'cache'
+            elif node.func.attr == 'persist':
+                if node.args:
+                    # Check for StorageLevel.MEMORY_AND_DISK
+                    arg = node.args[0]
+                    if isinstance(arg, ast.Attribute) and isinstance(arg.value, ast.Name):
+                        if arg.value.id == 'StorageLevel' and arg.attr == 'MEMORY_AND_DISK':
+                            return 'persist_memory_and_disk'
+                return 'persist'
+        return 'unknown'
+
+    def _has_cache_in_chain(self, node):
+        current = node
+        while isinstance(current, ast.Attribute):
+            if current.attr in ['cache', 'persist']:
+                return True
+            current = current.value
+        return False
+
+    def _get_cache_type_from_chain(self, node):
+        current = node
+        while isinstance(current, ast.Attribute):
+            if current.attr == 'cache':
+                return 'cache'
+            elif current.attr == 'persist':
+                return 'persist'
+            current = current.value
+        return 'unknown'
+
+    def _is_chained_filter_count(self, node):
+        if isinstance(node.func, ast.Attribute) and node.func.attr == 'count':
+            if isinstance(node.func.value, ast.Call):
+                if isinstance(node.func.value.func, ast.Attribute):
+                    return node.func.value.func.attr == 'filter'
+        return False
+
+    def _get_base_variable(self, node):
+        current = node
+        while hasattr(current, 'value'):
+            current = current.value
+        if isinstance(current, ast.Name):
+            return current.id
+        return None
+
+    def _get_source_line(self, line_number):
+        try:
+            with open(self.filename, 'r') as f:
+                lines = f.readlines()
+                if line_number <= len(lines):
+                    return lines[line_number - 1].strip()
+        except:
+            pass
+        return ""
+
+    def analyze_patterns(self):
+        # Pattern 1 & 2: Multiple actions on cached DataFrames
+        for var_name, (cache_line, cache_type) in self.cached_vars.items():
+            actions = self.var_actions.get(var_name, [])
+            if len(actions) > 1:
+                severity = min(len(actions), 5)  # Cap at 5
+
+                # Count different types of issues
+                count_actions = [a for a in actions if a[0] == 'count']
+                loop_actions = [a for a in actions if a[3]]  # in_loop is True
+                filter_count_actions = [a for a in actions if a[0] == 'filter_count']
+                agg_actions = [a for a in actions if a[0].startswith('aggregation_')]
+
+                issue_type = "Multiple actions on cached DataFrame"
+                details = []
+
+                if len(count_actions) > 1:
+                    issue_type = "Multiple count() calls on cached DataFrame"
+                    details.append(f"Found {len(count_actions)} count() calls")
+
+                if loop_actions:
+                    issue_type = "Actions on cached DataFrame inside loops"
+                    details.append(f"Found {len(loop_actions)} actions in loops")
+
+                if filter_count_actions:
+                    details.append(f"Found {len(filter_count_actions)} filter().count() patterns")
+
+                if agg_actions:
+                    details.append(f"Found {len(agg_actions)} aggregation operations")
+
+                if cache_type == 'persist_memory_and_disk':
+                    details.append("Uses MEMORY_AND_DISK storage level")
+                    severity += 1
+
+                # Get context lines
+                context_lines = []
+                cache_line_code = self._get_source_line(cache_line)
+                context_lines.append(f"  {cache_line_code}")
+
+                for action, line_num, code, in_loop in actions[:5]:  # Show first 5 actions
+                    prefix = "  [LOOP] " if in_loop else "  "
+                    context_lines.append(f"{prefix}{code}")
+
+                if len(actions) > 5:
+                    context_lines.append(f"  ... and {len(actions) - 5} more actions")
+
+                self.issues.append({
+                    'file': self.filename,
+                    'line': cache_line,
+                    'type': issue_type,
+                    'severity': severity,
+                    'details': details,
+                    'context': context_lines,
+                    'var_name': var_name
+                })
 
 
-def test_rdd_isEmpty_storage(spark, df):
-    print("\n=== Testing rdd.isEmpty() - Check Storage tab ===")
+def scan_file(filepath: str) -> List[Dict]:
+    """Scan a single Python file for Spark performance patterns."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
 
-    spark.catalog.clearCache()
+        tree = ast.parse(content, filename=filepath)
+        detector = SparkPatternDetector(filepath)
+        detector.visit(tree)
+        detector.analyze_patterns()
 
-    cached_df = df.persist(StorageLevel.MEMORY_ONLY)
-    cached_df.cache()
-
-    print("1. DataFrame persisted and cached")
-    print("2. Triggering initial cache population...")
-
-    count = cached_df.count()
-    print(f"   Count: {count:,} rows")
-
-    print("3. Check Spark UI Storage tab now - should show full caching")
-    input("   Press Enter when you've checked the Storage tab...")
-
-    print("4. Now calling rdd.isEmpty()...")
-    is_empty = cached_df.rdd.isEmpty()
-    print(f"   Result: {is_empty}")
-
-    print("5. Check Spark UI Storage tab again - look for partial caching!")
-    print("   You should see fewer cached partitions now")
-    input("   Press Enter after checking Storage tab...")
-
-    print("6. Running another operation to see recomputation...")
-    start = time.time()
-    group_count = cached_df.groupBy("computed").count().count()
-    duration = time.time() - start
-    print(f"   GroupBy operation: {duration:.3f}s")
-
-    print("7. Final check - Storage tab should show the impact")
-    input("   Press Enter after final Storage tab check...")
+        return detector.issues
+    except Exception as e:
+        print(f"Error scanning {filepath}: {e}", file=sys.stderr)
+        return []
 
 
-def test_limit_count_storage(spark, df):
-    print("\n=== Testing limit(1).count() - Check Storage tab ===")
+def scan_directory(directory: str) -> List[Dict]:
+    """Recursively scan directory for Python files."""
+    all_issues = []
 
-    spark.catalog.clearCache()
+    for root, dirs, files in os.walk(directory):
+        # Skip common irrelevant directories
+        dirs[:] = [d for d in dirs if d not in ['.git', '__pycache__', '.pytest_cache', 'node_modules']]
 
-    cached_df = df.persist(StorageLevel.MEMORY_ONLY)
-    cached_df.cache()
+        for file in files:
+            if file.endswith('.py'):
+                filepath = os.path.join(root, file)
+                issues = scan_file(filepath)
+                all_issues.extend(issues)
 
-    print("1. DataFrame persisted and cached")
-    print("2. Triggering initial cache population...")
+    return all_issues
 
-    count = cached_df.count()
-    print(f"   Count: {count:,} rows")
 
-    print("3. Check Spark UI Storage tab now - should show full caching")
-    input("   Press Enter when you've checked the Storage tab...")
+def format_output(issues: List[Dict]) -> None:
+    """Format and print the detected issues."""
+    if not issues:
+        print("No Spark performance patterns detected.")
+        return
 
-    print("4. Now calling limit(1).count()...")
-    is_empty = cached_df.limit(1).count() == 0
-    print(f"   Result: {is_empty}")
+    # Sort by severity (descending) then by file
+    issues.sort(key=lambda x: (-x['severity'], x['file'], x['line']))
 
-    print("5. Check Spark UI Storage tab again - should maintain full caching")
-    input("   Press Enter after checking Storage tab...")
+    print(f"Found {len(issues)} potential performance issues:\n")
 
-    print("6. Running another operation...")
-    start = time.time()
-    group_count = cached_df.groupBy("computed").count().count()
-    duration = time.time() - start
-    print(f"   GroupBy operation: {duration:.3f}s")
+    for issue in issues:
+        severity_stars = "⭐" * issue['severity']
+        print(f"{issue['file']}:{issue['line']} - {issue['type']} {severity_stars}")
 
-    print("7. Final check - Storage tab should show maintained caching")
-    input("   Press Enter after final Storage tab check...")
+        for line in issue['context']:
+            print(line)
+
+        if issue['details']:
+            for detail in issue['details']:
+                print(f"  └─ {detail}")
+
+        print()
 
 
 def main():
-    print("Storage UI Cache Visualization Test")
-    print("This will help you see partial caching on Spark UI Storage tab")
-    print("\nOpen Spark UI at: http://localhost:4040")
-    print("Navigate to Storage tab to see cache details")
+    parser = argparse.ArgumentParser(
+        description="Scan Python files for Spark performance regression patterns",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                    # Scan current directory
+  %(prog)s /path/to/spark/repo  # Scan specific directory
+  %(prog)s --file myfile.py    # Scan single file
+        """
+    )
 
-    spark = get_spark()
+    parser.add_argument(
+        'directory',
+        nargs='?',
+        default='.',
+        help='Directory to scan (default: current directory)'
+    )
 
-    try:
-        df = create_data(spark)
+    parser.add_argument(
+        '--file',
+        help='Scan a single Python file instead of directory'
+    )
 
-        choice = input("\nWhich test? (1=rdd.isEmpty, 2=limit.count, 3=both): ")
+    parser.add_argument(
+        '--min-severity',
+        type=int,
+        default=1,
+        help='Minimum severity to report (1-5, default: 1)'
+    )
 
-        if choice in ['1', '3']:
-            test_rdd_isEmpty_storage(spark, df)
+    args = parser.parse_args()
 
-        if choice in ['2', '3']:
-            test_limit_count_storage(spark, df)
+    if args.file:
+        if not os.path.exists(args.file):
+            print(f"File not found: {args.file}", file=sys.stderr)
+            sys.exit(1)
+        issues = scan_file(args.file)
+    else:
+        if not os.path.exists(args.directory):
+            print(f"Directory not found: {args.directory}", file=sys.stderr)
+            sys.exit(1)
+        issues = scan_directory(args.directory)
 
-        print("\nTest complete!")
+    # Filter by minimum severity
+    filtered_issues = [issue for issue in issues if issue['severity'] >= args.min_severity]
 
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        print("Keeping Spark session alive for UI inspection...")
-        input("Press Enter to shutdown Spark...")
-        spark.stop()
+    format_output(filtered_issues)
+
+    if filtered_issues:
+        print(f"\nSummary: {len(filtered_issues)} issues found")
+        severity_counts = defaultdict(int)
+        for issue in filtered_issues:
+            severity_counts[issue['severity']] += 1
+
+        for severity in sorted(severity_counts.keys(), reverse=True):
+            stars = "⭐" * severity
+            print(f"  Severity {severity} {stars}: {severity_counts[severity]} issues")
 
 
 if __name__ == "__main__":
